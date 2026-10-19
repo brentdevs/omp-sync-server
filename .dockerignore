@@ -1,0 +1,17 @@
+.git
+.data
+.env
+.env.*
+!.env.example
+node_modules
+**/node_modules
+result
+result-*
+coverage
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.token

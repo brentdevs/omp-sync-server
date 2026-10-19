@@ -1,0 +1,46 @@
+services:
+  broker:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - broker-data:/data
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    # The credential vault is reachable only on the private Compose network.
+    # Dockerfile.broker's healthcheck also waits for the generated token file.
+
+  sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      OMP_SYNC_DATA_DIR: /data
+      OMP_SYNC_HOST: 0.0.0.0
+      OMP_SYNC_PORT: "8787"
+      OMP_SYNC_BROKER_URL: http://broker:8765
+      OMP_SYNC_BROKER_TOKEN_FILE: /broker/.omp/auth-broker.token
+    ports:
+      - "${OMP_SYNC_PUBLISH_HOST:-127.0.0.1}:${OMP_SYNC_PUBLISH_PORT:-8787}:8787"
+    volumes:
+      - sync-data:/data
+      - broker-data:/broker:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+
+volumes:
+  sync-data:
+  broker-data:
