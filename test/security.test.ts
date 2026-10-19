@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { Config } from "../src/config";
 import { startServer, type SyncServer } from "../src/server";
 import { Store } from "../src/store";
+import { waitForServerEOF } from "../scripts/smoke-stream";
 
 const apps: SyncServer[] = [];
 const upstreams: Server<undefined>[] = [];
@@ -76,8 +77,7 @@ test("HTTP broker stream revocation cancels upstream and releases device slots",
   const reader = response.body!.getReader();
   await reader.read();
   app.store.revoke(paired.device.id);
-  const end = await reader.read().then(item => item.done, () => true);
-  expect(end).toBe(true);
+  expect(await waitForServerEOF(reader, 3000)).toBe(true);
   await cancelled.promise;
   expect((await fetch(`${url}/v1/snapshot`, { headers })).status).toBe(401);
 }, 7000);

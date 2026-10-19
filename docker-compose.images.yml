@@ -1,0 +1,6 @@
+# Pull-only deployment: remove build fallbacks so failed pulls cannot use stale local builds.
+services:
+  broker:
+    build: !reset null
+  sync:
+    build: !reset null
