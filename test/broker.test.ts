@@ -76,16 +76,17 @@ describe("broker proxy", () => {
       ["GET", "/v1/snapshot/stream/", 404],
       ["POST", "/v1/credential/not-numeric/refresh", 404],
       ["POST", "/v1/credential/1%2f2/block", 404],
-      ["POST", "/v1/credential/1/blocks", 405],
-      ["DELETE", "/v1/credential/1/refresh", 405],
-      ["POST", "/v1/snapshot", 405],
-      ["HEAD", "/v1/healthz", 405],
-      ["OPTIONS", "/v1/credential", 405],
-      ["GET", "/v1/credential", 405],
+      ["POST", "/v1/credential/1/blocks", 405, "DELETE"],
+      ["DELETE", "/v1/credential/1/refresh", 405, "POST"],
+      ["POST", "/v1/snapshot", 405, "GET"],
+      ["HEAD", "/v1/healthz", 405, "GET"],
+      ["OPTIONS", "/v1/credential", 405, "POST"],
+      ["GET", "/v1/credential", 405, "POST"],
+      ["GET", "/v1/credential/1/block", 405, "POST, DELETE"],
     ] as const;
-    for (const [method, path, status] of refused) {
+    for (const [method, path, status, allow] of refused) {
       await expect(proxyBroker(new Request(`http://sync.invalid${path}`, { method }), config(broker), new AbortController().signal))
-        .rejects.toMatchObject({ status });
+        .rejects.toMatchObject({ status, ...(allow ? { headers: { Allow: allow } } : {}) });
     }
     expect(hits).toBe(0);
   });
@@ -163,8 +164,83 @@ describe("broker proxy", () => {
     await cancelled.promise;
   });
 
-  test("longpoll headers and established SSE survive the normal 15-second header deadline", async () => {
+  test("ordinary body idleness cancels upstream without expiring active bodies or quiet SSE", async () => {
+    const stalledCancelled = Promise.withResolvers<void>();
+    const device = new AbortController();
+    const encoder = new TextEncoder();
+    let ticker: Timer | undefined;
+    let healthyBody!: ReadableStreamDefaultController<Uint8Array>;
     let events!: ReadableStreamDefaultController<Uint8Array>;
+    const broker = upstream(request => {
+      const path = new URL(request.url).pathname;
+      if (path === "/v1/snapshot/stream") {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            events = controller;
+            controller.enqueue(encoder.encode(": connected\n\n"));
+          },
+        }), { headers: { "Content-Type": "text/event-stream" } });
+      }
+      if (path === "/v1/usage/history") {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            healthyBody = controller;
+            controller.enqueue(encoder.encode("first\n"));
+            // Real sockets must deliver chunks while the native idle watchdog
+            // runs; fake timers cannot advance fetch's network I/O.
+            ticker = setInterval(() => controller.enqueue(encoder.encode("tick\n")), 25);
+          },
+          cancel() { clearInterval(ticker); },
+        }));
+      }
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(encoder.encode("partial\n")); },
+        cancel() { stalledCancelled.resolve(); },
+      }));
+    });
+    const options = { bodyIdleTimeoutMs: 200 };
+    const stream = await proxyBroker(new Request("http://sync.invalid/v1/snapshot/stream"), config(broker), device.signal, options);
+    const streamReader = stream.body!.getReader();
+    await streamReader.read();
+    const nextEvent = streamReader.read().then(
+      chunk => ({ chunk, error: undefined }),
+      error => ({ chunk: undefined, error }),
+    );
+    try {
+      const healthy = await proxyBroker(new Request("http://sync.invalid/v1/usage/history"), config(broker), device.signal, options);
+      const healthyResult = healthy.text().then(
+        text => ({ text, error: undefined }),
+        error => ({ text: undefined, error }),
+      );
+      const stalled = await proxyBroker(new Request("http://sync.invalid/v1/snapshot"), config(broker), device.signal, options);
+      const stalledReader = stalled.body!.getReader();
+      expect(new TextDecoder().decode((await stalledReader.read()).value)).toBe("partial\n");
+      await expect(stalledReader.read()).rejects.toMatchObject({ name: "AbortError" });
+      await stalledCancelled.promise;
+
+      clearInterval(ticker);
+      healthyBody.enqueue(encoder.encode("last\n"));
+      healthyBody.close();
+      const result = await healthyResult;
+      expect(result.error).toBeUndefined();
+      expect(result.text).toStartWith("first\n");
+      expect(result.text).toContain("tick\n");
+      expect(result.text).toEndWith("last\n");
+
+      events.enqueue(encoder.encode("event: entry\ndata: {\"id\":42}\n\n"));
+      const event = await nextEvent;
+      expect(event.error).toBeUndefined();
+      expect(new TextDecoder().decode(event.chunk?.value)).toContain("event: entry");
+    } finally {
+      clearInterval(ticker);
+      device.abort();
+      await streamReader.cancel().catch(() => {});
+    }
+  });
+
+  test("longpoll, usage refresh headers, and established SSE survive the normal 15-second header deadline", async () => {
+    let events!: ReadableStreamDefaultController<Uint8Array>;
+    const device = new AbortController();
     const broker = upstream(async request => {
       const url = new URL(request.url);
       if (url.pathname === "/v1/snapshot/stream") {
@@ -175,30 +251,47 @@ describe("broker proxy", () => {
           },
         }), { headers: { "Content-Type": "text/event-stream" } });
       }
-      if (url.searchParams.get("wait") !== "30000") return new Response(null, { status: 400 });
+      if (url.pathname === "/v1/snapshot") {
+        if (url.searchParams.get("wait") !== "30000" || request.headers.get("if-none-match") !== '"7"') {
+          return new Response(null, { status: 400 });
+        }
+      } else if (url.pathname !== "/v1/usage") {
+        return new Response(null, { status: 404 });
+      }
       // Deliberately use the platform clock: this integration checks native
       // fetch/socket header delivery against the proxy's real header deadline.
       await Bun.sleep(16_000);
-      return new Response(null, { status: 304, headers: { ETag: '"7"' } });
+      return url.pathname === "/v1/snapshot"
+        ? new Response(null, { status: 304, headers: { ETag: '"7"' } })
+        : Response.json({ remaining: 42 });
     });
-    const stream = await proxyBroker(new Request("http://sync.invalid/v1/snapshot/stream"), config(broker), new AbortController().signal);
+    const stream = await proxyBroker(new Request("http://sync.invalid/v1/snapshot/stream"), config(broker), device.signal);
     const reader = stream.body!.getReader();
-    expect(new TextDecoder().decode((await reader.read()).value)).toBe(": connected\n\n");
-    const nextEvent = reader.read().then(
-      chunk => ({ chunk, error: undefined }),
-      error => ({ chunk: undefined, error }),
-    );
-    const response = await proxyBroker(new Request("http://sync.invalid/v1/snapshot?wait=30000", {
-      headers: { "If-None-Match": '"7"' },
-    }), config(broker), new AbortController().signal);
-    expect(response.status).toBe(304);
-    expect(response.headers.get("etag")).toBe('"7"');
-    events.enqueue(new TextEncoder().encode("event: entry\ndata: {\"id\":42}\n\n"));
-    const next = await nextEvent;
-    expect(next.error).toBeUndefined();
-    expect(new TextDecoder().decode(next.chunk?.value)).toContain("event: entry");
-    await reader.cancel();
-  }, 20_000);
+    try {
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe(": connected\n\n");
+      const nextEvent = reader.read().then(
+        chunk => ({ chunk, error: undefined }),
+        error => ({ chunk: undefined, error }),
+      );
+      const [response, usage] = await Promise.all([
+        proxyBroker(new Request("http://sync.invalid/v1/snapshot?wait=30000", {
+          headers: { "If-None-Match": '"7"' },
+        }), config(broker), device.signal),
+        proxyBroker(new Request("http://sync.invalid/v1/usage"), config(broker), device.signal),
+      ]);
+      expect(response.status).toBe(304);
+      expect(response.headers.get("etag")).toBe('"7"');
+      expect(usage.status).toBe(200);
+      await usage.arrayBuffer();
+      events.enqueue(new TextEncoder().encode("event: entry\ndata: {\"id\":42}\n\n"));
+      const next = await nextEvent;
+      expect(next.error).toBeUndefined();
+      expect(new TextDecoder().decode(next.chunk?.value)).toContain("event: entry");
+    } finally {
+      device.abort();
+      await reader.cancel().catch(() => {});
+    }
+  }, 30_000);
 
   test("unconfigured brokers and connection failures are sanitized", async () => {
     const request = new Request("http://sync.invalid/v1/snapshot");

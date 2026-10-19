@@ -7,12 +7,20 @@ import { integer, object, parseMutations, text } from "./validation";
 
 const MAX_BODY = 1_048_576;
 const encoder = new TextEncoder();
-function json(value: unknown, status = 200): Response {
-  return Response.json(value, { status, headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
+function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return Response.json(value, { status, headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...headers } });
 }
 async function body(request: Request): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) throw new HttpError(415, "unsupported_media_type", "Use application/json");
-  const bytes = await request.arrayBuffer();
+  let bytes: ArrayBuffer;
+  try { bytes = await request.arrayBuffer(); }
+  catch (error) {
+    // Bun can reject a chunked body before the application receives its bytes.
+    if (error instanceof Error && error.message === "Request body exceeded maxRequestBodySize") {
+      throw new HttpError(413, "body_too_large", "Maximum body size is 1 MiB");
+    }
+    throw new HttpError(400, "body_unreadable", "Request body could not be read");
+  }
   if (bytes.byteLength > MAX_BODY) throw new HttpError(413, "body_too_large", "Maximum body size is 1 MiB");
   try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
   catch { throw new HttpError(400, "invalid_json", "Invalid JSON body"); }
@@ -93,7 +101,10 @@ export function startServer(config: Config, store = new Store(config.dataDir)): 
             if (result.done) { connection.abort.signal.removeEventListener("abort", cancel); connection.cleanup(); controller.close(); }
             else controller.enqueue(result.value);
           } catch {
-            connection.abort.signal.removeEventListener("abort", cancel); connection.cleanup(); controller.error(new Error("Broker connection ended"));
+            connection.abort.signal.removeEventListener("abort", cancel);
+            connection.cleanup();
+            if (connection.abort.signal.aborted) controller.close();
+            else controller.error(new Error("Broker connection ended"));
           }
         },
         cancel() { connection.abort.abort(); cancel(); },
@@ -112,6 +123,10 @@ export function startServer(config: Config, store = new Store(config.dataDir)): 
         const url = new URL(request.url);
         if (request.headers.has("origin")) throw new HttpError(403, "browser_access_denied", "This API accepts native clients, not browser origins");
         if (url.pathname === "/healthz" && request.method === "GET") return json({ status: "ok", version: "0.1.0" });
+        // OMP's status client deliberately sends this exact health request without auth.
+        if (url.pathname === "/v1/healthz" && request.method === "GET") {
+          return await proxyBroker(request, config, request.signal);
+        }
         if (url.pathname === "/sync/v1/pair" && request.method === "POST") {
           const peer = server.requestIP(request)?.address ?? "unknown";
           const now = Date.now();
@@ -123,8 +138,10 @@ export function startServer(config: Config, store = new Store(config.dataDir)): 
           return json(store.pair(text(input.code, "code")), 201);
         }
         const authorization = request.headers.get("authorization");
-        if (!authorization?.startsWith("Bearer ") || authorization.length > 256) throw new HttpError(401, "unauthorized", "A device bearer token is required");
-        const device = store.authenticate(authorization.slice(7));
+        if (!authorization || authorization.length > 256) throw new HttpError(401, "unauthorized", "A device bearer token is required");
+        const bearer = /^Bearer +(\S+)$/i.exec(authorization);
+        if (!bearer) throw new HttpError(401, "unauthorized", "A device bearer token is required");
+        const device = store.authenticate(bearer[1]!);
         if (url.pathname.startsWith("/v1/")) {
           server.timeout(request, 0);
           return await broker(device, request);
@@ -142,7 +159,7 @@ export function startServer(config: Config, store = new Store(config.dataDir)): 
           default: throw new HttpError(404, "not_found", "Unknown endpoint or method");
         }
       } catch (error) {
-        if (error instanceof HttpError) return json({ error: { code: error.code, message: error.message, ...(error.details !== undefined ? { details: error.details } : {}) } }, error.status);
+        if (error instanceof HttpError) return json({ error: { code: error.code, message: error.message, ...(error.details !== undefined ? { details: error.details } : {}) } }, error.status, error.headers);
         // Do not log request URLs, bodies, tokens, or upstream exception text.
         console.error("Request failed with an internal error");
         return json({ error: { code: "internal_error", message: "Internal server error" } }, 500);
@@ -152,7 +169,13 @@ export function startServer(config: Config, store = new Store(config.dataDir)): 
   });
 
   const tick = setInterval(() => {
-    for (const connection of connections) if (!store.isActive(connection.deviceId)) connection.abort.abort();
+    try {
+      for (const connection of connections) if (!store.isActive(connection.deviceId)) connection.abort.abort();
+    } catch {
+      // A failed revocation check must not leave credential streams authorized.
+      console.error("Revocation check failed; closing active streams");
+      for (const connection of connections) { connection.abort.abort(); connection.cleanup(); }
+    }
     for (const entry of events) {
       try {
         if (entry.epoch !== store.epoch) {
@@ -181,8 +204,8 @@ export function startServer(config: Config, store = new Store(config.dataDir)): 
       stopped = true;
       clearInterval(tick);
       for (const connection of connections) { connection.abort.abort(); connection.cleanup(); }
-      await server.stop(true);
-      store.close();
+      try { await server.stop(true); }
+      finally { store.close(); }
     },
   };
 }

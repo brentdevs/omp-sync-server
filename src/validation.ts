@@ -15,8 +15,8 @@ export function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 export function text(value: unknown, label: string, max = 128): string {
-  if (typeof value !== "string" || !value.trim() || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
-    throw new HttpError(400, "invalid_request", `${label} must be non-empty text of at most ${max} characters`);
+  if (typeof value !== "string" || !value.trim() || !value.isWellFormed() || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new HttpError(400, "invalid_request", `${label} must be well-formed, non-empty text of at most ${max} characters`);
   }
   return value;
 }

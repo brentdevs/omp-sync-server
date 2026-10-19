@@ -4,16 +4,16 @@ WORKDIR /app
 COPY broker/package.json broker/bun.lock ./
 # The broker uses the published CLI bundle; optional ML install scripts are unnecessary.
 RUN bun install --frozen-lockfile --production --ignore-scripts \
-    && mkdir -p /data \
-    && chown bun:bun /data
+    && mkdir -p /data /tokens \
+    && chown bun:bun /data /tokens
 
 ENV NODE_ENV=production \
-    HOME=/data \
+    HOME=/tokens \
     PI_CONFIG_DIR=.omp \
     PI_CODING_AGENT_DIR=/data/.omp/agent
 USER bun
 EXPOSE 8765
 HEALTHCHECK --interval=5s --timeout=3s --start-period=15s --retries=12 \
-  CMD ["bun", "-e", "const token = (await Bun.file('/data/.omp/auth-broker.token').text()).trim(); if (!token) process.exit(1); const r = await fetch('http://127.0.0.1:8765/v1/healthz', {signal: AbortSignal.timeout(2000)}); process.exit(r.ok ? 0 : 1)"]
+  CMD ["bun", "-e", "const token = (await Bun.file('/tokens/.omp/auth-broker.token').text()).trim(); if (!token) process.exit(1); const r = await fetch('http://127.0.0.1:8765/v1/healthz', {signal: AbortSignal.timeout(2000)}); process.exit(r.ok ? 0 : 1)"]
 ENTRYPOINT ["bun", "/app/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"]
 CMD ["auth-broker", "serve", "--bind=0.0.0.0:8765"]

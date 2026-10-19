@@ -10,6 +10,7 @@ services:
     security_opt: [no-new-privileges:true]
     volumes:
       - broker-data:/data
+      - broker-token:/tokens
     tmpfs:
       - /tmp:rw,nosuid,nodev,mode=1777
     # The credential vault is reachable only on the private Compose network.
@@ -32,15 +33,16 @@ services:
       OMP_SYNC_HOST: 0.0.0.0
       OMP_SYNC_PORT: "8787"
       OMP_SYNC_BROKER_URL: http://broker:8765
-      OMP_SYNC_BROKER_TOKEN_FILE: /broker/.omp/auth-broker.token
+      OMP_SYNC_BROKER_TOKEN_FILE: /broker-token/.omp/auth-broker.token
     ports:
       - "${OMP_SYNC_PUBLISH_HOST:-127.0.0.1}:${OMP_SYNC_PUBLISH_PORT:-8787}:8787"
     volumes:
       - sync-data:/data
-      - broker-data:/broker:ro
+      - broker-token:/broker-token:ro
     tmpfs:
       - /tmp:rw,nosuid,nodev,mode=1777
 
 volumes:
   sync-data:
   broker-data:
+  broker-token:

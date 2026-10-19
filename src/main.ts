@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config";
 import { startServer } from "./server";
@@ -38,20 +39,21 @@ try {
     if ((["revoke", "backup"].includes(command) ? rest.length !== 1 : rest.length !== 0)) throw new Error("Unexpected arguments; use --help");
     if (command !== "pair" && (args.values.name || args.values.profile)) throw new Error("--name and --profile apply only to pair");
     if (command === "pair" && !args.values.name) throw new Error("pair requires --name NAME");
-    const config = loadConfig(args.values["data-dir"]);
     if (command === "serve") {
+      const config = loadConfig(args.values["data-dir"]);
       const app = startServer(config);
       console.log(`omp-sync-server listening on ${app.server.url.origin}`);
       let shuttingDown = false;
       const shutdown = async () => {
         if (shuttingDown) return;
         shuttingDown = true;
-        await app.stop();
+        try { await app.stop(); }
+        catch { console.error("Server shutdown failed"); process.exitCode = 1; }
       };
       process.on("SIGINT", () => { void shutdown(); });
       process.on("SIGTERM", () => { void shutdown(); });
     } else {
-      const store = new Store(config.dataDir);
+      const store = new Store(resolve(args.values["data-dir"] ?? process.env.OMP_SYNC_DATA_DIR ?? ".data"));
       try {
         switch (command) {
           case "pair": console.log(JSON.stringify(store.issuePairing(args.values.name!, args.values.profile ?? "default"), null, 2)); break;

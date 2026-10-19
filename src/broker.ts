@@ -1,7 +1,7 @@
 import { HttpError } from "./errors";
 
 const REQUEST_HEADERS = ["Content-Type", "If-None-Match", "OMP-Auth-Broker-Capabilities", "Accept"];
-const RESPONSE_HEADERS = ["ETag", "Vary", "Content-Type", "Cache-Control"];
+const RESPONSE_HEADERS = ["ETag", "Vary", "Content-Type", "Cache-Control", "X-Accel-Buffering"];
 const GET = ["GET"];
 const POST = ["POST"];
 const DELETE = ["DELETE"];
@@ -40,11 +40,17 @@ function selectedHeaders(source: Headers, names: readonly string[]): Headers {
   return headers;
 }
 
-/** Authenticated-device access to the owner's shared OMP broker credential pool. */
+export interface BrokerProxyOptions {
+  /** Response-body idle limit; only the snapshot SSE route is exempt. */
+  bodyIdleTimeoutMs?: number;
+}
+
+/** Allowlisted access to the owner's shared OMP broker credential pool. */
 export async function proxyBroker(
   request: Request,
   config: { brokerUrl?: string; brokerToken?: string },
   signal: AbortSignal,
+  options: BrokerProxyOptions = {},
 ): Promise<Response> {
   if (!config.brokerUrl || !config.brokerToken) {
     throw new HttpError(503, "broker_unavailable", "Auth broker is not configured.");
@@ -53,7 +59,9 @@ export async function proxyBroker(
   const methods = routeMethods(incoming.pathname);
   if (!methods) throw new HttpError(404, "not_found", "Unknown auth broker route.");
   if (!methods.includes(request.method)) {
-    throw new HttpError(405, "method_not_allowed", "Method is not supported for this auth broker route.");
+    throw new HttpError(405, "method_not_allowed", "Method is not supported for this auth broker route.", undefined, {
+      Allow: methods.join(", "),
+    });
   }
 
   let upstreamUrl: URL;
@@ -80,8 +88,11 @@ export async function proxyBroker(
     signal.removeEventListener("abort", abort);
   };
   // Snapshot longpoll may intentionally withhold headers for up to 30 seconds.
-  const headerTimer = setTimeout(abort, incoming.pathname === "/v1/snapshot" ? 35_000 : 15_000);
-  headerTimer.unref();
+  // Usage refreshes can outlive the normal header deadline: OMP's per-account
+  // client timeout, caller cancellation, and the broker's own request bound apply.
+  const headerTimer = incoming.pathname === "/v1/usage" ? undefined
+    : setTimeout(abort, incoming.pathname === "/v1/snapshot" ? 35_000 : 15_000);
+  headerTimer?.unref();
   let upstream: Response;
   try {
     upstream = await fetch(upstreamUrl, {
@@ -117,8 +128,17 @@ export async function proxyBroker(
   const reader = upstream.body.getReader();
   let finished = false;
   let downstream: ReadableStreamDefaultController<Uint8Array>;
+  let bodyIdleTimer: Timer | undefined;
+  const resetBodyIdleTimer = () => {
+    if (incoming.pathname === "/v1/snapshot/stream") return;
+    clearTimeout(bodyIdleTimer);
+    bodyIdleTimer = setTimeout(abort, options.bodyIdleTimeoutMs ?? 60_000);
+    bodyIdleTimer.unref();
+  };
   const finish = () => {
+    if (finished) return;
     finished = true;
+    clearTimeout(bodyIdleTimer);
     upstreamAbort.signal.removeEventListener("abort", onAbort);
     cleanup();
   };
@@ -133,6 +153,7 @@ export async function proxyBroker(
       downstream = controller;
       upstreamAbort.signal.addEventListener("abort", onAbort, { once: true });
       if (upstreamAbort.signal.aborted) onAbort();
+      else resetBodyIdleTimer();
     },
     async pull(controller) {
       try {
@@ -142,6 +163,7 @@ export async function proxyBroker(
           finish();
           controller.close();
         } else {
+          if (chunk.value.byteLength > 0) resetBodyIdleTimer();
           controller.enqueue(chunk.value);
         }
       } catch {

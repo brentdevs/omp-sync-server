@@ -20,9 +20,20 @@ Compose starts two non-root, health-checked services:
 - `sync`: this server, published at `127.0.0.1:8787` by default.
 - `broker`: upstream OMP **18.12.2**, with its private SQLite vault and background OAuth refresher. No published port.
 
-Named volumes `sync-data` and `broker-data` survive container recreation. The sync service reads the broker's token from a read-only volume. `.env.example` documents host/port overrides. Do not run `docker compose down --volumes` unless deliberately discarding both databases and all credentials.
+Named volumes `sync-data`, private `broker-data`, and token-only `broker-token` survive container recreation. Sync mounts only `broker-token` read-only, not the credential vault. `.env.example` documents host/port overrides. Do not run `docker compose down --volumes` unless deliberately discarding both databases and all credentials.
 
 Use a TLS reverse proxy or private VPN before accessing this from another device. Configure the proxy with streaming/unbuffered SSE, a sufficiently long read timeout, and a 1 MiB request-body limit. Do not expose plaintext HTTP on an untrusted network. Browser origins/CORS are intentionally unsupported.
+
+### Upgrading the broker token layout
+
+If upgrading from the original shared-vault mount, keep the same Compose project and existing volumes:
+
+```sh
+docker compose stop sync broker
+docker compose up -d --build --wait
+```
+
+The vault remains at `/data/.omp/agent/agent.db` in `broker-data`. The broker creates its internal bearer at `/tokens/.omp/auth-broker.token` in `broker-token`; sync reads it at `/broker-token/.omp/auth-broker.token`. Existing device tokens remain valid because sync substitutes the new internal bearer. An old `/data/.omp/auth-broker.token` may remain unused in the private vault volume; do not remove the vault or its volume when retiring that legacy token file.
 
 ### Broker login and migration
 
@@ -72,7 +83,7 @@ Without a configured broker, settings sync still works; broker routes return `50
 
 ## Operator commands
 
-All commands accept `--data-dir PATH`; otherwise `OMP_SYNC_DATA_DIR` or `.data` is used. Administrator access is local filesystem access, not a remotely exposed admin API.
+All commands accept `--data-dir PATH`; otherwise `OMP_SYNC_DATA_DIR` or `.data` is used. Administrator access is local filesystem access, not a remotely exposed admin API. Only `serve` loads broker/network configuration: local administration works when the broker is stopped, its token file is absent, or serve-only settings are invalid.
 
 ```sh
 bun src/main.ts pair --name desktop --profile work
@@ -82,13 +93,36 @@ bun src/main.ts backup /secure-backups/sync.db
 bun src/main.ts rotate-epoch
 ```
 
-Under Compose, use `docker compose exec sync bun /app/src/main.ts ...` instead. Backup destinations must be inside a writable mount (for example `/data/sync-backup.db`); copy backups out with `docker compose cp`.
+For a running Compose service, use `docker compose exec sync bun /app/src/main.ts ...` instead. For a stopped service, use `docker compose run --rm --no-deps sync COMMAND...`. Backup destinations must be inside a writable mount (for example `/data/sync-backup.db`); copy backups out with `docker compose cp`.
 
 - Pairings are bound to the operator-selected name/profile. Codes and device tokens are stored as SHA-256 hashes, not plaintext.
 - Revocation refuses new authenticated requests immediately. Existing sync and broker streams are cancelled on the next server tick, normally within one second. It cannot revoke upstream credentials already received by a device.
 - `backup` uses SQLite's online backup via `VACUUM INTO`, creates a mode-0600 file, and refuses an existing destination. Encrypt exported backups.
 - Back up the broker vault separately using a consistent SQLite backup or stop the broker before copying its volume. Do not copy only a live WAL database's main file.
 - **After restoring a sync backup**, stop the server, restore the database without stale WAL/SHM files, run `rotate-epoch`, then restart. Epoch rotation invalidates old cursors and mutations so clients must reconcile a fresh snapshot. Ordinary restarts retain the epoch, revisions and retry history. A server cannot automatically detect every rollback of its own database.
+
+### Restore a sync backup under Compose
+
+Use a consistent backup exported to the host, not a main database file copied while WAL writes were active. Stop every process that can open the sync database. Preserve the current database and sidecars separately if you need a rollback copy.
+
+```sh
+(
+  set -eu
+  docker compose stop sync
+  docker compose run --rm --no-deps -T --entrypoint sh sync -ec '
+    umask 077
+    test ! -e /data/sync-restore.db
+    cat > /data/sync-restore.db
+    test -s /data/sync-restore.db
+    rm -f /data/sync.db-wal /data/sync.db-shm
+    mv -f /data/sync-restore.db /data/sync.db
+    bun /app/src/main.ts rotate-epoch
+  ' < /secure-backups/sync.db
+  docker compose up -d --wait sync
+)
+```
+
+Restore and epoch rotation happen in one-off containers before the listener restarts, including when the broker token file is missing. Any failure leaves sync stopped; inspect a leftover `/data/sync-restore.db` before retrying. Do not restart until restore and rotation both succeed.
 
 ## Configuration
 
@@ -105,11 +139,12 @@ The broker token is loaded at startup. Restart sync after changing it. Upstream 
 
 ## Client protocol
 
-All JSON responses use `Cache-Control: no-store`. Except `/healthz` and pairing, requests require `Authorization: Bearer <device-token>`. Tokens never belong in URLs. Maximum request size is 1 MiB. Errors have the form `{ "error": { "code": "...", "message": "...", "details": {} } }`; `details` is optional.
+All JSON responses use `Cache-Control: no-store`. Except GET `/healthz`, GET `/v1/healthz`, and pairing, requests require `Authorization: Bearer <device-token>`. The scheme is case-insensitive; token bytes are not. Tokens never belong in URLs. Maximum request size is 1 MiB. Application errors have the form `{ "error": { "code": "...", "message": "...", "details": {} } }`; `details` is optional. Bun or a reverse proxy may reject an oversized body directly with HTTP 413 without that JSON envelope.
 
 | Method | Endpoint | Behavior |
 | --- | --- | --- |
 | GET | `/healthz` | Process liveness, not broker readiness |
+| GET | `/v1/healthz` | Public upstream broker health, compatible with `omp auth-broker status`; 503 if unconfigured |
 | POST | `/sync/v1/pair` | Exchange `{ "code": "..." }` for `{ device, token }`; 201 |
 | GET | `/sync/v1/snapshot` | Consistent `{ epoch, profile, cursor, records }` |
 | POST | `/sync/v1/mutations` | Atomic revision-checked transaction |
@@ -127,6 +162,8 @@ Records have `kind`, `key`, `revision`, `deleted`, `deviceId`, `updatedAt` (Unix
 - `secret`: a separate sensitive configuration value, keyed by a client-defined reference.
 
 Values are JSON, not YAML documents. This server validates the sync envelope, not the complete version-specific OMP schema. Clients must validate settings/provider contents against their OMP version before applying them. Do not publish environment, project, runtime or default layers as global settings. Clients also own device-local exclusions and approval for executable or credential-routing changes.
+
+Record keys, operation IDs, and pairing metadata must be well-formed Unicode strings. Unpaired UTF-16 surrogates are rejected rather than normalized into ambiguous identities. Valid supplementary characters round-trip; JSON values are serialized separately and are not subject to identifier normalization.
 
 Example write (substitute the snapshot's epoch):
 
@@ -160,6 +197,8 @@ Use streaming `fetch` so the bearer can be sent in a header. SSE starts with `re
 
 Changes are observed on a one-second tick, including commits/revocations by operator commands or another process. Clients should reconnect with backoff and use `/changes` polling when SSE is unavailable. Public pairing is rate-limited to 30 attempts per socket peer/minute; forwarded identity headers are not trusted. Behind one reverse proxy this budget is shared across clients.
 
+If a database error prevents checking revocation, the server closes existing authorized streams instead of leaving them open with unknown authorization state.
+
 ### Broker access
 
 Use OMP's existing broker client without modifying its protocol:
@@ -169,7 +208,9 @@ export OMP_AUTH_BROKER_URL=https://sync.example.com
 export OMP_AUTH_BROKER_TOKEN=YOUR_DEVICE_TOKEN
 ```
 
-Known OMP `/v1/*` broker routes are authenticated with the device token and forwarded to the private broker with its master bearer. Streaming snapshots, conditional polling, credential uploads, disable, refresh, block and usage operations are supported. Unknown routes, unsupported methods, redirects and caller-supplied forwarded identity/cookies are refused or stripped.
+Known OMP `/v1/*` broker routes, except public GET `/v1/healthz`, are authenticated with the device token and forwarded to the private broker with its master bearer. Streaming snapshots, conditional polling, credential uploads, disable, refresh, block and usage operations are supported. Unknown routes, redirects and caller-supplied forwarded identity/cookies are refused or stripped. Unsupported broker methods return 405 with `Allow`. Broker SSE preserves `X-Accel-Buffering: no`.
+
+Ordinary broker requests have a 15-second response-header deadline; snapshot long polling gets 35 seconds. Aggregate `/v1/usage` waits use the OMP client's account-scaled timeout, caller cancellation, and the upstream broker's own request bound rather than a shorter proxy deadline. After headers, non-SSE responses have a 60-second idle watchdog reset by body progress. Snapshot SSE has no proxy lifetime/body-idle cap and retains caller/device cancellation.
 
 The broker owns OAuth refresh tokens. Snapshots contain usable API keys/access tokens but replace refresh tokens with OMP's remote sentinel. Environment/config API-key overrides still participate in OMP's ordinary precedence; broker mode does not automatically upload them. Expired OAuth access tokens require a reachable broker; settings offline support does not imply independent offline OAuth refresh.
 

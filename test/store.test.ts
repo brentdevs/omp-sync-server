@@ -81,3 +81,14 @@ test("change pagination and epoch invalidation protect reconnects and restored b
   expect(() => store.mutate(a, parseMutations({ epoch, operationId: "old-epoch", mutations: [{ kind: "setting", key: "new", value: true, expectedRevision: 0 }] }))).toThrow("Fetch a fresh snapshot");
   expect(store.snapshot("work").cursor).toBe(second.cursor);
 });
+
+test("pairing metadata and operation identifiers reject malformed UTF-16 without changing state", () => {
+  const { store } = fixture();
+  const devices = store.devices();
+  for (const [name, profile] of [["bad\ud800", "work"], ["name", "bad\udc00"]]) {
+    expect(() => store.issuePairing(name!, profile!)).toThrow();
+  }
+  expect(() => parseMutations({ epoch: store.epoch, operationId: "bad\ud800", mutations: [{ kind: "setting", key: "valid", expectedRevision: 0, value: true }] })).toThrow();
+  expect(store.devices()).toEqual(devices);
+  expect(store.snapshot("work").records).toEqual([]);
+});
