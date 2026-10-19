@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.data/
+state/
+result
+result-*
+*.db
+*.db-shm
+*.db-wal
+secrets/
