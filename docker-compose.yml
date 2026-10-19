@@ -1,5 +1,6 @@
 services:
   broker:
+    image: "${OMP_SYNC_BROKER_IMAGE:-ghcr.io/brentdevs/omp-sync-server-broker:latest}"
     build:
       context: .
       dockerfile: Dockerfile.broker
@@ -17,6 +18,7 @@ services:
     # Dockerfile.broker's healthcheck also waits for the generated token file.
 
   sync:
+    image: "${OMP_SYNC_IMAGE:-ghcr.io/brentdevs/omp-sync-server:latest}"
     build:
       context: .
       dockerfile: Dockerfile

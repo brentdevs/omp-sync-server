@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add SHA-pinned GitHub Actions for Linux/macOS checks, Nix packaging, and live Compose integration.
+- Gate multi-platform sync/broker GHCR image builds and publication on CI; publish main, source-SHA, and validated release tags with provenance and SBOMs.
+- Add configurable published-image references and a reusable local-build/pull-only Compose smoke command.
 - Reject malformed UTF-16 identifiers before SQLite persistence while preserving valid supplementary characters.
 - Separate the broker's token-only volume from its private credential vault and exclude nested secrets/state from Docker contexts.
 - Keep local administration independent of broker configuration and document stopped-service Compose restore and epoch rotation.

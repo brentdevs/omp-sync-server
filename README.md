@@ -4,6 +4,36 @@ Self-hosted settings/provider sync for oh-my-pi, with SQLite persistence and a d
 
 This repository implements the **server**, not the OMP client extension. The HTTP protocol below is ready for that extension. It does not watch or modify an operator's local OMP configuration.
 
+## CI and container releases
+
+GitHub Actions runs on pull requests, pushes to `main`, version tags, and manual dispatch:
+
+- Frozen-lockfile install, TypeScript checking, and the test suite on Linux and macOS.
+- Nix flake/package checks and packaged CLI smoke commands on Linux.
+- An isolated Compose smoke scenario covering both running containers, pairing, sync, conflicts, revocation, vault containment, and persistence after recreation.
+- Multi-platform container builds for `linux/amd64` and `linux/arm64`, gated on the checks above.
+
+The workflows pin third-party actions to commit SHAs. PR builds never log in to GHCR or publish. Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`; no personal registry secret is needed.
+
+| Image | Purpose |
+| --- | --- |
+| `ghcr.io/brentdevs/omp-sync-server` | Sync HTTP service and local operator CLI |
+| `ghcr.io/brentdevs/omp-sync-server-broker` | Pinned upstream OMP auth broker |
+
+Both images use the same release/source tags:
+
+| Successful workflow run | Published tags |
+| --- | --- |
+| Push/manual run on `main` | `latest`, `main`, `sha-<full-commit>` |
+| Tag `vX.Y.Z` or `vX.Y.Z-prerelease` | `X.Y.Z` or `X.Y.Z-prerelease`, plus `sha-<full-commit>` |
+| Pull request or manual feature-branch run | Build only; nothing published |
+
+Release tags do not move `latest`. Version tags must have three numeric components, no leading zeroes, and no build metadata. For example, after reviewing and merging a release, `git tag v0.1.0` followed by `git push origin v0.1.0` runs the same checks before publishing. The CI workflow can also be dispatched manually on `main` to rebuild/publish its current revision.
+
+Published builds include OCI source/revision/license labels, provenance, and an SBOM. A commit tag identifies source; pin each image's `@sha256:...` digest when exact immutable image bytes matter.
+
+**First publication:** these workflows must be merged and a publishing run must succeed before the image references exist. GHCR creates new packages as private by default. For anonymous pulls, change **both** packages to Public in GitHub package settings after their first publication. Otherwise authenticate with a token granting `read:packages` and access to both packages. Existing packages must grant this repository's Actions workflow write access. See [GHCR access and visibility](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+
 ## Run with Docker Compose
 
 Requirements: Docker Engine and Docker Compose.
@@ -13,7 +43,16 @@ docker compose up --build --wait
 docker compose exec sync bun /app/src/main.ts pair --name laptop --profile work
 ```
 
-The second command prints a single-use pairing code, valid for ten minutes. Exchange it at `POST /sync/v1/pair`. The returned device token is shown only at enrollment; store it securely on the device.
+To deploy already-published images instead of building locally:
+
+```sh
+docker compose pull
+docker compose up -d --no-build --wait
+```
+
+Compose defaults to both GHCR `:latest` images. Set `OMP_SYNC_IMAGE` and `OMP_SYNC_BROKER_IMAGE` to matching version/source tags or their image-specific digests to pin a deployment; `.env.example` shows the overrides. Local `--build` and published `--no-build` deployments share the same private volumes, networking, and security settings.
+
+The `pair` command prints a single-use pairing code, valid for ten minutes. Exchange it at `POST /sync/v1/pair`. The returned device token is shown only at enrollment; store it securely on the device.
 
 Compose starts two non-root, health-checked services:
 
@@ -23,6 +62,8 @@ Compose starts two non-root, health-checked services:
 Named volumes `sync-data`, private `broker-data`, and token-only `broker-token` survive container recreation. Sync mounts only `broker-token` read-only, not the credential vault. `.env.example` documents host/port overrides. Do not run `docker compose down --volumes` unless deliberately discarding both databases and all credentials.
 
 Use a TLS reverse proxy or private VPN before accessing this from another device. Configure the proxy with streaming/unbuffered SSE, a sufficiently long read timeout, and a 1 MiB request-body limit. Do not expose plaintext HTTP on an untrusted network. Browser origins/CORS are intentionally unsupported.
+
+Run the container integration scenario locally with `bun run smoke:compose`. It creates a unique Compose project, binds an ephemeral loopback port, and removes only that project's containers/volumes when finished. To exercise pulling configured image references without building, use `OMP_SYNC_SMOKE_PULL=1 bun run smoke:compose`. This is a synthetic test deployment, not an upgrade command for an existing server.
 
 ### Upgrading the broker token layout
 

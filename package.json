@@ -6,7 +6,8 @@
   "scripts": {
     "start": "bun src/main.ts serve",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke:compose": "bun scripts/smoke-compose.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",
