@@ -36,7 +36,7 @@ Published builds include OCI source/revision/license labels, provenance, and an 
 
 ## Run with Docker Compose
 
-Requirements: Docker Engine and Docker Compose.
+Requirements: Docker Engine and Docker Compose 2.24.4 or newer (the pull-only override uses `!reset`).
 
 ```sh
 docker compose up --build --wait
@@ -46,11 +46,13 @@ docker compose exec sync bun /app/src/main.ts pair --name laptop --profile work
 To deploy already-published images instead of building locally:
 
 ```sh
-docker compose pull
-docker compose up -d --no-build --wait
+docker compose -f docker-compose.yml -f docker-compose.images.yml \
+  up -d --no-build --pull always --wait
 ```
 
 Compose defaults to both GHCR `:latest` images. Set `OMP_SYNC_IMAGE` and `OMP_SYNC_BROKER_IMAGE` to matching version/source tags or their image-specific digests to pin a deployment; `.env.example` shows the overrides. Local `--build` and published `--no-build` deployments share the same private volumes, networking, and security settings.
+
+The image-only override removes `build:` definitions, making registry failures fatal even when a local image has the requested tag. `--no-build --pull always` alone is not sufficient for a buildable service on some Compose versions. Use the same two `-f` options for subsequent image-only `up`/`run` operations. Local `up --build` intentionally retags the configured image references; do not use it for an image-only deployment.
 
 The `pair` command prints a single-use pairing code, valid for ten minutes. Exchange it at `POST /sync/v1/pair`. The returned device token is shown only at enrollment; store it securely on the device.
 
@@ -63,7 +65,11 @@ Named volumes `sync-data`, private `broker-data`, and token-only `broker-token` 
 
 Use a TLS reverse proxy or private VPN before accessing this from another device. Configure the proxy with streaming/unbuffered SSE, a sufficiently long read timeout, and a 1 MiB request-body limit. Do not expose plaintext HTTP on an untrusted network. Browser origins/CORS are intentionally unsupported.
 
-Run the container integration scenario locally with `bun run smoke:compose`. It creates a unique Compose project, binds an ephemeral loopback port, and removes only that project's containers/volumes when finished. To exercise pulling configured image references without building, use `OMP_SYNC_SMOKE_PULL=1 bun run smoke:compose`. This is a synthetic test deployment, not an upgrade command for an existing server.
+Run the container integration scenario locally with `bun run smoke:compose`. Build mode ignores configured deployment image references, creates unique project-scoped build tags and an ephemeral loopback port, and removes that project's containers, volumes, and build tags when finished. Shared build caches are not pruned.
+
+To exercise pulling configured image references without building, use `OMP_SYNC_SMOKE_PULL=1 bun run smoke:compose`. Pull mode automatically applies `docker-compose.images.yml`, fails on registry errors instead of falling back to cached images, and retains the pulled image tags in the shared local cache. Both modes are synthetic test deployments, not upgrade commands for an existing server.
+
+The revocation check requires server-side EOF within five seconds; client aborts and timeouts fail the scenario. SIGINT/SIGTERM cancel the active Compose command before project cleanup and return exit codes 130/143. Cleanup errors fail an otherwise successful run; when a scenario already failed, its original error is preserved and cleanup errors are reported separately. Cleanup is best-effort if the process is forcibly killed or Docker is unavailable.
 
 ### Upgrading the broker token layout
 

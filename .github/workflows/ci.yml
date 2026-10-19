@@ -68,8 +68,47 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
-      - name: Build and exercise both containers
-        run: bun run smoke:compose
+      - name: Build and exercise both containers without retagging deployment images
+        env:
+          OMP_SYNC_IMAGE: omp-sync-protected-sync:keep
+          OMP_SYNC_BROKER_IMAGE: omp-sync-protected-broker:keep
+        run: |
+          docker pull oven/bun:1.4.2
+          docker tag oven/bun:1.4.2 "$OMP_SYNC_IMAGE"
+          docker tag oven/bun:1.4.2 "$OMP_SYNC_BROKER_IMAGE"
+          protected="$(docker image inspect --format '{{.Id}}' oven/bun:1.4.2)"
+          bun run smoke:compose
+          test "$(docker image inspect --format '{{.Id}}' "$OMP_SYNC_IMAGE")" = "$protected"
+          test "$(docker image inspect --format '{{.Id}}' "$OMP_SYNC_BROKER_IMAGE")" = "$protected"
+          test -z "$(docker image ls --filter 'reference=omp-sync-smoke-*:smoke' --quiet)"
+          docker image rm "$OMP_SYNC_IMAGE" "$OMP_SYNC_BROKER_IMAGE"
+      - name: Reject failed pulls even when cached images exist
+        env:
+          OMP_SYNC_IMAGE: 127.0.0.1:1/omp-sync-pull-server:missing
+          OMP_SYNC_BROKER_IMAGE: 127.0.0.1:1/omp-sync-pull-broker:missing
+          OMP_SYNC_PUBLISH_HOST: 127.0.0.1
+          OMP_SYNC_PUBLISH_PORT: "0"
+        run: |
+          project="omp-sync-pull-failure-${GITHUB_RUN_ID}"
+          compose=(docker compose --project-name "$project" -f docker-compose.yml -f docker-compose.images.yml)
+          cleanup() {
+            status=$?
+            if ! "${compose[@]}" down --volumes --remove-orphans; then
+              [ "$status" -ne 0 ] || status=1
+            fi
+            if ! docker image rm "$OMP_SYNC_IMAGE" "$OMP_SYNC_BROKER_IMAGE"; then
+              [ "$status" -ne 0 ] || status=1
+            fi
+            exit "$status"
+          }
+          docker tag oven/bun:1.4.2 "$OMP_SYNC_IMAGE"
+          docker tag oven/bun:1.4.2 "$OMP_SYNC_BROKER_IMAGE"
+          trap cleanup EXIT
+          if "${compose[@]}" up -d --no-build --pull always --wait --wait-timeout 15; then
+            echo '::error::An unavailable registry must not start cached images.'
+            exit 1
+          fi
+          test -z "$("${compose[@]}" ps --all --quiet)"
 
   images:
     name: Container images
